@@ -458,14 +458,15 @@ def _v14_scaffold_score(text):
     state_branches = len(re.findall(r"\\b(?:if|elseif)\\s+state\\s*==", text))
     dense_table = len(re.findall(r"^\\s*\\[\\d+\\]\\s*=", text, re.M))
     score += min(80, caller_regs * 5)
-    score += min(60, runtime * 2)
+    score += min(18, runtime)
     score += min(40, handlers * 2)
     score += min(30, state_branches // 3)
     if dense_table >= 200:
         score += 30
     if "local ... = ..." in text:
         score += 40
-    if "unresolved Luraph runtime helper" in text and runtime >= 6:
+    if ("unresolved Luraph runtime helper" in text and runtime >= 6 and
+            (caller_regs or handlers or state_branches >= 6 or dense_table >= 200)):
         score += 20
     return score
 
@@ -521,6 +522,7 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     requested = set()
     last_bufs = ""
     text = None
+    stats = {"functions": 0, "errors": 0, "fallbacks": 0}
     rounds = args.devirt_rounds
     # Intermediate rounds only need the constant requests and decrypted
     # strings, which come from walking each function: they skip the
@@ -545,10 +547,14 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             if os.environ.get("DEVIRT_REQS"):
                 for rq in sorted(new):
                     print("[*]     request %s" % rq, file=sys.stderr)
-            if (not new and stats.get("errors", 0) and not os.environ.get("DEVIRT_V14_PARTIAL")):
-                print("[!] v14.x quick walk has %d unresolved VM state(s); skipping expensive partial structuring"
+            if not new and stats.get("errors", 0):
+                if os.environ.get("DEVIRT_STRICT"):
+                    print("[!] v14.x quick walk has %d unresolved VM state(s); strict mode refuses partial output"
+                          % stats["errors"], file=sys.stderr)
+                    return False
+                print("[*] v14.x quick walk has %d unresolved VM state(s); continuing with partial full lift"
                       % stats["errors"], file=sys.stderr)
-                return False
+                full = True
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 full = True
         if full:
@@ -639,6 +645,16 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             break
         with open(ppath, "w", encoding="utf-8", newline="\n") as f:
             f.write(m.group(1))
+    if text is None:
+        print("[*] constant recovery stopped before a full lift; attempting best-effort partial lift",
+              file=sys.stderr)
+        try:
+            text, stats, _, _ = devirt.run_big_stack(
+                devirt.lift_program, job.source_path, ppath, chunk_paths, None)
+        except Exception as ex:
+            print("[!] best-effort partial lift failed: %s: %s" % (type(ex).__name__, ex),
+                  file=sys.stderr)
+
     finished = devirt.finish_text(text or "").strip()
     # The selected proto may be the v14 Roblox anti-analysis fingerprint.
     # Strip only the strongly-recognized probe suite; if nothing remains, this
@@ -654,6 +670,11 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
         print("[!] refusing v14 static output: selected root is still Luraph VM/bootstrap scaffolding",
               file=sys.stderr)
         return False
+    unresolved = stats.get("errors", 0) if isinstance(stats, dict) else 0
+    if unresolved:
+        finished = ("-- PARTIAL RECOVERY: %d unresolved VM state(s) remain\n"
+                    "-- Recovered regions below are static devirtualization output; unresolved paths were not guessed.\n\n"
+                    % unresolved) + finished
     header = job.credit_header()
     job.write(dpath, header + finished + "\n")
     return True
@@ -934,9 +955,8 @@ def run(job):
         if semantic is not None:
             llines = max(1, lifted.count("\n"))
             slines = max(1, semantic.count("\n"))
-            unresolved = ("luraph_runtime" in lifted or
-                          "unresolved Luraph runtime helper" in lifted or
-                          "devirt:" in lifted)
+            partial_static = "PARTIAL RECOVERY:" in lifted
+            unresolved = "devirt:" in lifted
             direct_observable = all(
                 (not ln.strip()) or ln.lstrip().startswith("--") or
                 re.match(r"^(?:print|warn)\s*\(", ln.strip())
@@ -947,7 +967,8 @@ def run(job):
                 (("print(" in semantic and "print(" not in lifted) or
                  ("warn(" in semantic and "warn(" not in lifted))
             )
-            if unresolved or static_missed_observable or (llines > 200 and llines > slines * 10):
+            if (not partial_static and
+                    (unresolved or static_missed_observable or (llines > 200 and llines > slines * 10))):
                 return write_semantic_candidate(semantic)
 
         nil_calls = lifted.count("(nil)(")

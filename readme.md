@@ -42,7 +42,7 @@ Features include:
 - Repeated devirtualization/lifting rounds
 - VM state reconstruction
 - Control-flow recovery
-- Partial-graph recovery when some states remain unresolved
+- Partial-graph recovery by default when some states remain unresolved (`DEVIRT_STRICT=1` rejects partial graphs)
 - Roblox/Luau runtime emulation
 - Behavior tracing
 - String recovery

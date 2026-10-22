@@ -768,11 +768,10 @@ STACK_WALK_MAX = int(os.environ.get("DEVIRT_STACK_WALK_MAX", "150000"))
 class WalkIncomplete(Unsupported):
     """A VM walk could not be proven complete.
 
-    Older versions of this driver silently lowered the partial graph.  That is
-    dangerous for a devirtualizer because a single missing edge can remove an
-    arbitrary part of the original program while still producing valid-looking
-    Luau.  Final lifts therefore raise this unless partial output was explicitly
-    enabled.
+    A missing edge can remove part of the original program while still producing
+    valid-looking Luau. v14 now preserves the resolved graph by default and marks
+    unresolved states in generated output; set DEVIRT_STRICT=1 to reject partial
+    graphs instead.
     """
 
 
@@ -3411,7 +3410,7 @@ class FunctionLifter:
         self.prog.requests |= lf.requests
 
         bad = unresolved_nodes(order)
-        allow_partial = bool(os.environ.get("DEVIRT_V14_PARTIAL")) and not bool(os.environ.get("DEVIRT_STRICT"))
+        allow_partial = not bool(os.environ.get("DEVIRT_STRICT"))
         if bad and not allow_partial:
             details = "; ".join(
                 "%s:%s: %s" % (k[0], k[1], why) for k, why in bad[:12]

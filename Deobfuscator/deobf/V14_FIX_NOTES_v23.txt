@@ -1,0 +1,10 @@
+Luraph v14.x deobfuscator v23
+
+- Partial static devirtualization is now the default for v14.7, v14.8 and v14.9.
+- Unresolved VM states no longer abort before full structuring when the resolved graph is still usable.
+- Partial results are explicitly marked with an unresolved-state count; unresolved paths are never guessed.
+- DEVIRT_STRICT=1 restores reject-on-any-unresolved-state behavior.
+- If a constant-request rerun fails before the first full lift, the driver now performs one best-effort lift from the latest proto dump instead of returning no source.
+- Runtime-helper stubs alone no longer classify an otherwise useful partial payload as Luraph bootstrap scaffolding.
+- A valid partial static lift is no longer replaced by a tiny print/warn behavior trace merely because helper stubs remain.
+- Source and packaged bin copies are kept in sync for all three v14 engines.

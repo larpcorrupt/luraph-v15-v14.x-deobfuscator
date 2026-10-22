@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 import harness
 import traceout as trace
@@ -95,27 +96,63 @@ def patch_entries(source, path):
     return "\n".join(lines)
 
 
-def _trace_root_hint(body):
-    """Best-effort payload-root pid from envlog's per-statement call chains.
+def _trace_root_candidates(body):
+    """Rank likely payload-root pids from envlog call-chain markers.
 
-    Marker chains are outermost-first.  Even when the payload calls nested user
-    functions, the second pid stays the payload root.  v14.x does not reliably
-    make the outer bootstrap proto pid 1, so this is a better fallback than the
-    old v15-only assumption.
+    Large v14 scripts enter many helper/probe closures before and after the
+    actual chunk. Using the *last* second pid in the stack therefore picks a
+    runtime helper surprisingly often. Rank the immediate child of the
+    outermost instrumented frame instead: favour a child that accounts for
+    many statements in one/few invocations, and strongly penalize children
+    that return to an emitting parent (the fingerprint/probe shape).
     """
-    hint = None
+    scores = {}
+    hits = {}
+    invs = {}
+    last_seen = {}
+    last_child = {}
+    pos = 0
     for line in body.splitlines():
         m = re.match(r"^\s*--@\d+\s*(.*)$", line)
         if not m:
             continue
-        pids = []
+        pos += 1
+        chain = []
         for part in m.group(1).split(","):
-            q = re.match(r"^(\d+):", part.strip())
+            q = re.match(r"^(\d+):([^,\s]*)", part.strip())
             if q:
-                pids.append(int(q.group(1)))
-        if len(pids) >= 2:
-            hint = pids[1]
-    return hint
+                chain.append((int(q.group(1)), q.group(2)))
+        if len(chain) >= 2:
+            parent, child = chain[0][0], chain[1][0]
+            w = 5 + min(3, len(chain) - 2)
+            if len(chain) == 2:
+                w += 1
+            scores[child] = scores.get(child, 0) + w
+            hits[child] = hits.get(child, 0) + 1
+            invs.setdefault(child, set()).add(chain[1][1])
+            last_seen[child] = pos
+            last_child[parent] = child
+        elif len(chain) == 1:
+            parent = chain[0][0]
+            child = last_child.get(parent)
+            if child is not None:
+                scores[child] = scores.get(child, 0) - 18
+                last_child.pop(parent, None)
+
+    for pid, xs in invs.items():
+        scores[pid] = scores.get(pid, 0) - max(0, len(xs) - 2) * 5
+
+    ranked = sorted(
+        scores,
+        key=lambda p: (scores[p], hits.get(p, 0), last_seen.get(p, 0)),
+        reverse=True,
+    )
+    return ranked
+
+
+def _trace_root_hint(body):
+    ranked = _trace_root_candidates(body)
+    return ranked[0] if ranked else None
 
 
 def _json_loads_loose(raw):
@@ -157,19 +194,73 @@ def _json_loads_loose(raw):
 
 
 def _apply_root_hint(protos_json, body):
-    """Fill a missing root_callee in the dump from the observed trace stack."""
-    hint = _trace_root_hint(body)
+    """Apply the strongest runtime payload-root hint to the captured dump.
+
+    v14's in-harness root_callee can be stale on large scripts. The weighted
+    marker vote is based on the complete rendered run, so let it override that
+    stale value and keep a short ranked list for diagnostics/fallbacks.
+    """
+    ranked = _trace_root_candidates(body)
+    hint = ranked[0] if ranked else None
     if hint is None or not protos_json or protos_json.startswith("error:"):
         return protos_json, hint
     try:
         data = _json_loads_loose(protos_json)
     except Exception:
         return protos_json, hint
-    if data.get("root_callee") is None and str(hint) in data.get("protos", {}):
-        data["root_callee"] = hint
-        protos_json = json.dumps(data, separators=(",", ":"))
-        print("[*] inferred payload root proto #%d from runtime call chain" % hint, file=sys.stderr)
+    protos = data.get("protos", {})
+    ranked = [pid for pid in ranked if str(pid) in protos][:8]
+    if not ranked:
+        return protos_json, hint
+    hint = ranked[0]
+    old = data.get("root_callee")
+    data["root_candidates"] = ranked
+    data["root_callee"] = hint
+    protos_json = json.dumps(data, separators=(",", ":"))
+    if old != hint:
+        if old is None:
+            print("[*] inferred payload root proto #%d from weighted runtime call chain" % hint, file=sys.stderr)
+        else:
+            print("[*] corrected payload root proto #%s -> #%d from weighted runtime call chain" % (old, hint), file=sys.stderr)
+    elif os.environ.get("DEVIRT_DEBUG"):
+        print("[*] payload root proto #%d confirmed by weighted runtime call chain" % hint, file=sys.stderr)
     return protos_json, hint
+
+
+def _v14_probe_signature_score(code):
+    """Score the narrow Roblox anti-analysis fingerprint used by Luraph v14.x.
+
+    This intentionally requires several independent markers so ordinary user
+    code that happens to use Path2D or one Roblox signal is not stripped.
+    """
+    if not code:
+        return 0
+    score = 0
+    if 'Instance.new("ScreenGui")' in code:
+        score += 1
+    if 'Instance.new("Frame")' in code:
+        score += 1
+    if 'Instance.new("Path2D")' in code and 'Path2DControlPoint.new' in code:
+        score += 3
+    curve_calls = len(re.findall(r':Get(?:Position|Tangent)OnCurve(?:ArcLength)?\(', code))
+    if curve_calls >= 5:
+        score += 3
+    if len(re.findall(r'^\s*task\.(?:spawn|delay)\(', code, re.M)) >= 2:
+        score += 2
+    event_calls = len(re.findall(r'\.(?:DescendantRemoving|ChildRemoved|AncestryChanged):Connect\(function', code))
+    if event_calls >= 2:
+        score += 3
+    # v14.8 in particular also ships an event-only ancestry fingerprint.
+    # Requiring several empty-looking AncestryChanged probes keeps this narrow
+    # enough not to classify an ordinary user signal connection as scaffolding.
+    ancestry_calls = len(re.findall(r'\.AncestryChanged:Connect\(function', code))
+    if ancestry_calls >= 4:
+        score += 4
+    if 'Instance.new("Folder")' in code and re.search(r':WaitForChild\("\d+"\)', code):
+        score += 2
+    if 'game:GetService("HttpService")' in code and 'game:GetService("RunService")' in code:
+        score += 2
+    return score
 
 
 def _strip_v14_probe_suite(code):
@@ -178,10 +269,10 @@ def _strip_v14_probe_suite(code):
     This is intentionally narrow and is only used after the static lifter has
     failed.  v14.8/v14.9 run a recognizable temporary Roblox fingerprint:
     empty task callbacks, a throwaway ScreenGui/Path2D tree, immediate
-    DescendantRemoving connect/disconnect pairs and throwaway Folders.  Those
+    DescendantRemoving/ChildRemoved/AncestryChanged connect/disconnect pairs and throwaway Folders.  Those
     statements are Luraph runtime scaffolding, not payload source.
     """
-    if 'Instance.new("Path2D")' not in code or "DescendantRemoving:Connect" not in code:
+    if _v14_probe_signature_score(code) < 8:
         return code
 
     lines = code.splitlines()
@@ -210,8 +301,21 @@ def _strip_v14_probe_suite(code):
             i += 1
             continue
 
-        # Immediate empty DescendantRemoving connection + disconnect.
-        m = re.match(r'^local\s+(\w+)\s*=\s*(.+)\.DescendantRemoving:Connect\(function\([^)]*\)\s*$', stripped)
+        # Some code generators/minifiers collapse the whole empty callback and
+        # disconnect onto one line.  Remove that form too, but only after the
+        # suite-level signature gate above has fired.
+        m = re.match(
+            r'^local\s+(\w+)\s*=\s*(.+?)\.(?:DescendantRemoving|ChildRemoved|AncestryChanged):Connect\(function\([^)]*\)\s*end\)\s*;?\s*\1:Disconnect\(\)\s*$',
+            stripped)
+        if m:
+            connection_vars.add(m.group(1))
+            i += 1
+            continue
+
+        # Immediate empty Roblox-signal connection + disconnect.
+        # AncestryChanged is used by the v14.8 fingerprint on game/workspace,
+        # throwaway folders and a couple of services.
+        m = re.match(r'^local\s+(\w+)\s*=\s*(.+)\.(?:DescendantRemoving|ChildRemoved|AncestryChanged):Connect\(function\([^)]*\)\s*$', stripped)
         if m and i + 2 < len(lines) and lines[i + 1].strip() == "end)"                 and lines[i + 2].strip() == m.group(1) + ":Disconnect()":
             connection_vars.add(m.group(1))
             i += 3
@@ -336,6 +440,76 @@ def _observable_trace_source(body):
     except Exception:
         return None
 
+
+def _v14_scaffold_score(text):
+    """How strongly a static result still resembles the Luraph VM/runtime.
+
+    These markers should never dominate real deobfuscated source.  Keep this
+    deliberately structural; user scripts may have a variable called state or
+    handlers, but they will not also contain our caller-register placeholders
+    and dozens of unresolved Luraph helper calls.
+    """
+    if not text:
+        return 10 ** 6
+    score = 0
+    caller_regs = text.count("the caller's registers")
+    runtime = text.count("luraph_runtime")
+    handlers = text.count("handlers[")
+    state_branches = len(re.findall(r"\\b(?:if|elseif)\\s+state\\s*==", text))
+    dense_table = len(re.findall(r"^\\s*\\[\\d+\\]\\s*=", text, re.M))
+    score += min(80, caller_regs * 5)
+    score += min(18, runtime)
+    score += min(40, handlers * 2)
+    score += min(30, state_branches // 3)
+    if dense_table >= 200:
+        score += 30
+    if "local ... = ..." in text:
+        score += 40
+    if ("unresolved Luraph runtime helper" in text and runtime >= 6 and
+            (caller_regs or handlers or state_branches >= 6 or dense_table >= 200)):
+        score += 20
+    return score
+
+
+def _looks_like_v14_scaffolding(text):
+    return _v14_scaffold_score(text) >= 24
+
+
+def _dump_root_candidates(ppath):
+    try:
+        data = _json_loads_loose(Path(ppath).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return [], None
+    protos = data.get("protos", {})
+    out = []
+    for pid in data.get("root_candidates") or []:
+        try:
+            n = int(pid)
+        except Exception:
+            continue
+        if str(n) in protos and n not in out:
+            out.append(n)
+    cur = data.get("root_callee")
+    try:
+        cur = int(cur) if cur is not None else None
+    except Exception:
+        cur = None
+    if cur is not None and str(cur) in protos and cur not in out:
+        out.insert(0, cur)
+    return out, cur
+
+
+def _set_dump_root(ppath, pid):
+    try:
+        data = _json_loads_loose(Path(ppath).read_text(encoding="utf-8", errors="replace"))
+        if str(pid) not in data.get("protos", {}):
+            return False
+        data["root_callee"] = int(pid)
+        Path(ppath).write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8", newline="\\n")
+        return True
+    except Exception:
+        return False
+
 def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     """Lift the captured protos; constants that only Luraph's lazy decoder can
     produce (code that never ran) are requested from further runs. With a
@@ -348,6 +522,7 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     requested = set()
     last_bufs = ""
     text = None
+    stats = {"functions": 0, "errors": 0, "fallbacks": 0}
     rounds = args.devirt_rounds
     # Intermediate rounds only need the constant requests and decrypted
     # strings, which come from walking each function: they skip the
@@ -372,10 +547,14 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             if os.environ.get("DEVIRT_REQS"):
                 for rq in sorted(new):
                     print("[*]     request %s" % rq, file=sys.stderr)
-            if (not new and stats.get("errors", 0) and not os.environ.get("DEVIRT_V14_PARTIAL")):
-                print("[!] v14.x quick walk has %d unresolved VM state(s); skipping expensive partial structuring"
+            if not new and stats.get("errors", 0):
+                if os.environ.get("DEVIRT_STRICT"):
+                    print("[!] v14.x quick walk has %d unresolved VM state(s); strict mode refuses partial output"
+                          % stats["errors"], file=sys.stderr)
+                    return False
+                print("[*] v14.x quick walk has %d unresolved VM state(s); continuing with partial full lift"
                       % stats["errors"], file=sys.stderr)
-                return False
+                full = True
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 full = True
         if full:
@@ -383,6 +562,61 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             t1 = time.time()
             text, stats, reqs, bufs = devirt.run_big_stack(devirt.lift_program, job.source_path, ppath, chunk_paths,
                                                            live and live())
+
+            # Large v14 scripts may create runtime/helper closures before the
+            # actual chunk root.  If the selected root clearly decompiles back
+            # into Luraph's own VM, try the next runtime-ranked roots from the
+            # *same* proto dump.  No script rerun is needed for this scan.
+            raw_text = text or ""
+            cleaned_text = _strip_v14_probe_suite(raw_text)
+            probe_only = bool(raw_text.strip()) and not cleaned_text.strip() and _v14_probe_signature_score(raw_text) >= 8
+            if cleaned_text.strip() and cleaned_text != raw_text:
+                text = cleaned_text
+            base_score = (10 ** 6) if probe_only else _v14_scaffold_score(text or "")
+            candidates, current_root = _dump_root_candidates(ppath)
+            if (base_score >= 24 or probe_only) and len(candidates) > 1:
+                best = (base_score, text, stats, reqs, bufs, current_root)
+                reason = "anti-tamper probe-only root" if probe_only else "VM/bootstrap scaffolding"
+                print("[!] selected v14 root is %s (score %d); scanning alternate roots"
+                      % (reason, base_score), file=sys.stderr)
+                tried = 0
+                scan_limit = 8 if probe_only else 4
+                for pid in candidates:
+                    if pid == current_root or tried >= scan_limit:
+                        continue
+                    tried += 1
+                    if not _set_dump_root(ppath, pid):
+                        continue
+                    at0 = time.time()
+                    try:
+                        atext, astats, areqs, abufs = devirt.run_big_stack(
+                            devirt.lift_program, job.source_path, ppath, chunk_paths, live and live())
+                    except Exception as ex:
+                        if os.environ.get("DEVIRT_DEBUG"):
+                            print("[*]   root #%d rejected: %s" % (pid, ex), file=sys.stderr)
+                        continue
+                    araw = atext or ""
+                    aclean = _strip_v14_probe_suite(araw)
+                    aprobe_only = bool(araw.strip()) and not aclean.strip() and _v14_probe_signature_score(araw) >= 8
+                    if aclean.strip() and aclean != araw:
+                        atext = aclean
+                    ascore = (10 ** 6) if aprobe_only else _v14_scaffold_score(atext or "")
+                    label = "probe-only" if aprobe_only else "candidate"
+                    print("[*]   root #%d: %s score %d, %d unlifted block(s) (%.1fs)"
+                          % (pid, label, ascore, astats.get("errors", 0), time.time() - at0), file=sys.stderr)
+                    # Scaffolding/probe score is the primary signal.  On a tie
+                    # prefer the candidate with fewer unresolved VM states.
+                    if (ascore, astats.get("errors", 0)) < (best[0], best[2].get("errors", 0)):
+                        best = (ascore, atext, astats, areqs, abufs, pid)
+                    if ascore < 24 and astats.get("errors", 0) == 0:
+                        break
+                _, text, stats, reqs, bufs, chosen_root = best
+                if chosen_root is not None:
+                    _set_dump_root(ppath, chosen_root)
+                if best[0] < base_score:
+                    print("[*] selected alternate payload root #%s (score %d -> %d)"
+                          % (chosen_root, base_score, best[0]), file=sys.stderr)
+
             new = reqs - requested
             print("[*]   %d functions, %d unlifted blocks, %d unstructured jumps, %d new constant requests (%.1fs)"
                   % (stats["functions"], stats["errors"], stats["fallbacks"], len(new), time.time() - t1),
@@ -411,13 +645,36 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             break
         with open(ppath, "w", encoding="utf-8", newline="\n") as f:
             f.write(m.group(1))
+    if text is None:
+        print("[*] constant recovery stopped before a full lift; attempting best-effort partial lift",
+              file=sys.stderr)
+        try:
+            text, stats, _, _ = devirt.run_big_stack(
+                devirt.lift_program, job.source_path, ppath, chunk_paths, None)
+        except Exception as ex:
+            print("[!] best-effort partial lift failed: %s: %s" % (type(ex).__name__, ex),
+                  file=sys.stderr)
+
     finished = devirt.finish_text(text or "").strip()
+    # The selected proto may be the v14 Roblox anti-analysis fingerprint.
+    # Strip only the strongly-recognized probe suite; if nothing remains, this
+    # was not the payload root and must not be accepted as deobfuscated source.
+    finished = _strip_v14_probe_suite(finished).strip()
     # Avoid duplicate/stale credit headers when the same output path is reused.
     finished = re.sub(r"^(?:-- Devirtualized with Luraph v14\.[789] engine\s*)+", "", finished).lstrip()
     if not finished:
         print("[!] v14.x lifter captured no liftable VM functions; falling back to the behavior trace",
               file=sys.stderr)
         return False
+    if _looks_like_v14_scaffolding(finished):
+        print("[!] refusing v14 static output: selected root is still Luraph VM/bootstrap scaffolding",
+              file=sys.stderr)
+        return False
+    unresolved = stats.get("errors", 0) if isinstance(stats, dict) else 0
+    if unresolved:
+        finished = ("-- PARTIAL RECOVERY: %d unresolved VM state(s) remain\n"
+                    "-- Recovered regions below are static devirtualization output; unresolved paths were not guessed.\n\n"
+                    % unresolved) + finished
     header = job.credit_header()
     job.write(dpath, header + finished + "\n")
     return True
@@ -675,6 +932,11 @@ def run(job):
     if strings is not None:
         job.write(job.path(".strings.txt"), strings)
     dpath = job.path(".devirt.luau")
+    # Never let a rejected/partial result from an earlier invocation win this run.
+    try:
+        os.remove(dpath)
+    except FileNotFoundError:
+        pass
     if protos_json is not None:
         ppath = job.path(".protos.json")
         if protos_json.startswith("error:"):
@@ -695,6 +957,18 @@ def run(job):
         with open(dpath, encoding="utf-8", errors="replace") as f:
             lifted = f.read()
 
+        if _looks_like_v14_scaffolding(lifted):
+            print("[!] rejected devirtualized output because it still contains Luraph VM/bootstrap scaffolding",
+                  file=sys.stderr)
+            if not job.debug:
+                os.remove(dpath)
+            if semantic is not None:
+                return write_semantic_candidate(semantic)
+            recovered = write_recovered_loadstring()
+            if recovered is not None:
+                return recovered
+            raise RuntimeError("v14 payload root could not be isolated from Luraph runtime scaffolding")
+
         # A one/few-statement payload must not turn into thousands of lines of
         # Luraph bootstrap code.  Known unresolved runtime helpers are another
         # strong sign that the static root followed the loader instead of the
@@ -703,9 +977,8 @@ def run(job):
         if semantic is not None:
             llines = max(1, lifted.count("\n"))
             slines = max(1, semantic.count("\n"))
-            unresolved = ("luraph_runtime" in lifted or
-                          "unresolved Luraph runtime helper" in lifted or
-                          "devirt:" in lifted)
+            partial_static = "PARTIAL RECOVERY:" in lifted
+            unresolved = "devirt:" in lifted
             direct_observable = all(
                 (not ln.strip()) or ln.lstrip().startswith("--") or
                 re.match(r"^(?:print|warn)\s*\(", ln.strip())
@@ -716,7 +989,8 @@ def run(job):
                 (("print(" in semantic and "print(" not in lifted) or
                  ("warn(" in semantic and "warn(" not in lifted))
             )
-            if unresolved or static_missed_observable or (llines > 200 and llines > slines * 10):
+            if (not partial_static and
+                    (unresolved or static_missed_observable or (llines > 200 and llines > slines * 10))):
                 return write_semantic_candidate(semantic)
 
         nil_calls = lifted.count("(nil)(")
