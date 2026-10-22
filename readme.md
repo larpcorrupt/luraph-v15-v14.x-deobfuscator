@@ -1,5 +1,4 @@
-DSC.GG/oxyenv
-MY CONTACT ON DISCORD: larpcorrupt USER ID: 1481960463289028649
+https://discord.gg/MCFSxSqRVp
 
 
 
