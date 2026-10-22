@@ -1,0 +1,6 @@
+Luraph v14.x deobfuscator v24
+
+- Fixes the bootstrap/scaffolding scorer regexes used by v14.7, v14.8 and v14.9.
+- Word-boundary/state-machine detection now matches real "if state ==" / "elseif state ==" code.
+- Dense numeric-table detection now matches serialized VM/proto tables correctly.
+- This improves alternate-root selection and prevents obvious Luraph bootstrap output from being accepted as a payload.
